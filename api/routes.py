@@ -110,10 +110,16 @@ async def disconnect_camera(oak_controller=Depends(get_oak_controller)):
 
 
 @router.get("/camera/discover")
-async def discover_cameras_endpoint():
+async def discover_cameras_endpoint(oak_controller=Depends(get_oak_controller)):
     """Discover Oak cameras on the network."""
     try:
-        cameras = discover_cameras()
+        if oak_controller:
+            # Use the Oak controller's discovery method
+            cameras = await oak_controller.discover_cameras()
+        else:
+            # Fallback to network discovery
+            cameras = await discover_cameras()
+        
         return create_response(
             success=True,
             message=f"Found {len(cameras)} cameras",
@@ -121,7 +127,7 @@ async def discover_cameras_endpoint():
         )
 
     except Exception as e:
-        logger.error(f"❌ Error discovering cameras: {e}")
+        logger.error(f"Error discovering cameras: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
