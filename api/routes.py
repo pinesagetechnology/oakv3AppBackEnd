@@ -403,3 +403,143 @@ async def download_file(file_type: str, filename: str):
     except Exception as e:
         logger.error(f"❌ Error downloading file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/camera/discover")
+async def discover_cameras_endpoint():
+    """Discover Oak cameras on the network with detailed info."""
+    try:
+        import depthai as dai
+
+        logger.info("🔍 Starting camera discovery...")
+        devices = dai.Device.getAllAvailableDevices()
+
+        discovered_cameras = []
+
+        for device_info in devices:
+            camera_data = {
+                "name": device_info.name,
+                "mxid": device_info.getMxId(),
+                "state": str(device_info.state),
+                "protocol": str(device_info.protocol),
+            }
+
+            # For PoE cameras, name is the IP address
+            if device_info.protocol == dai.XLinkProtocol.X_LINK_TCP_IP:
+                camera_data["ip_address"] = device_info.name
+                camera_data["connection_type"] = "PoE/Ethernet"
+                discovered_cameras.append(camera_data["ip_address"])
+            else:
+                camera_data["connection_type"] = "USB"
+
+            logger.info(f"📹 Found device: {camera_data}")
+
+        return create_response(
+            success=True,
+            message=f"Found {len(discovered_cameras)} PoE cameras",
+            data={
+                "cameras": discovered_cameras,
+                "all_devices": [
+                    {
+                        "name": d.name,
+                        "mxid": d.getMxId(),
+                        "state": str(d.state),
+                        "protocol": str(d.protocol),
+                    }
+                    for d in devices
+                ],
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Error discovering cameras: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/camera/debug/{ip_address}")
+async def debug_camera_connection(ip_address: str):
+    """Debug camera connection with detailed diagnostics."""
+    import socket
+    import subprocess
+    import platform
+    import depthai as dai
+
+    debug_info = {
+        "ip_address": ip_address,
+        "timestamp": datetime.now().isoformat(),
+        "tests": {},
+    }
+
+    # Test 1: Basic ping
+    try:
+        if platform.system().lower() == "windows":
+            cmd = ["ping", "-n", "1", "-w", "3000", ip_address]
+        else:
+            cmd = ["ping", "-c", "1", "-W", "3", ip_address]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        debug_info["tests"]["ping"] = {
+            "success": result.returncode == 0,
+            "response_time": "Available in output",
+            "output": (
+                result.stdout[:200] if result.returncode == 0 else result.stderr[:200]
+            ),
+        }
+    except Exception as e:
+        debug_info["tests"]["ping"] = {"success": False, "error": str(e)}
+
+    # Test 2: Port connectivity
+    try:
+        sock = socket.create_connection((ip_address, 9876), timeout=10)
+        sock.close()
+        debug_info["tests"]["port_9876"] = {
+            "success": True,
+            "message": "Port 9876 is open and accepting connections",
+        }
+    except Exception as e:
+        debug_info["tests"]["port_9876"] = {"success": False, "error": str(e)}
+
+    # Test 3: DepthAI device discovery
+    try:
+        devices = dai.Device.getAllAvailableDevices()
+        target_device = None
+
+        for device_info in devices:
+            if device_info.name == ip_address:
+                target_device = {
+                    "found": True,
+                    "name": device_info.name,
+                    "mxid": device_info.getMxId(),
+                    "state": str(device_info.state),
+                    "protocol": str(device_info.protocol),
+                }
+                break
+
+        if target_device:
+            debug_info["tests"]["device_discovery"] = target_device
+        else:
+            debug_info["tests"]["device_discovery"] = {
+                "found": False,
+                "available_devices": [d.name for d in devices],
+            }
+
+    except Exception as e:
+        debug_info["tests"]["device_discovery"] = {"success": False, "error": str(e)}
+
+    # Test 4: Try to connect with DepthAI
+    try:
+        device_info = dai.DeviceInfo(ip_address)
+        device = dai.Device(device_info)
+
+        debug_info["tests"]["depthai_connection"] = {
+            "success": True,
+            "device_name": device.getDeviceName(),
+            "platform": device.getPlatform().name,
+            "message": "Successfully connected and got device info",
+        }
+        device.close()
+
+    except Exception as e:
+        debug_info["tests"]["depthai_connection"] = {"success": False, "error": str(e)}
+
+    return debug_info
