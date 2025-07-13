@@ -464,16 +464,18 @@ async def discover_cameras_endpoint():
 
 @router.get("/camera/debug/{ip_address}")
 async def debug_camera_connection(ip_address: str):
-    """Debug camera connection with detailed diagnostics."""
+    """Debug camera connection with detailed diagnostics for OAK Camera v3."""
     import socket
     import subprocess
     import platform
     import depthai as dai
+    from datetime import datetime
 
     debug_info = {
         "ip_address": ip_address,
         "timestamp": datetime.now().isoformat(),
         "tests": {},
+        "recommendations": []
     }
 
     # Test 1: Basic ping
@@ -491,19 +493,34 @@ async def debug_camera_connection(ip_address: str):
                 result.stdout[:200] if result.returncode == 0 else result.stderr[:200]
             ),
         }
+        if result.returncode != 0:
+            debug_info["recommendations"].append("Device is not responding to ping - check network connectivity")
     except Exception as e:
         debug_info["tests"]["ping"] = {"success": False, "error": str(e)}
 
-    # Test 2: Port connectivity
-    try:
-        sock = socket.create_connection((ip_address, 9876), timeout=10)
-        sock.close()
-        debug_info["tests"]["port_9876"] = {
-            "success": True,
-            "message": "Port 9876 is open and accepting connections",
-        }
-    except Exception as e:
-        debug_info["tests"]["port_9876"] = {"success": False, "error": str(e)}
+    # Test 2: Port connectivity for multiple ports
+    ports_to_check = [9876, 14495, 14496, 14497]
+    debug_info["tests"]["port_connectivity"] = {}
+    
+    for port in ports_to_check:
+        try:
+            sock = socket.create_connection((ip_address, port), timeout=5)
+            sock.close()
+            debug_info["tests"]["port_connectivity"][f"port_{port}"] = {
+                "success": True,
+                "message": f"Port {port} is open and accepting connections",
+            }
+        except Exception as e:
+            debug_info["tests"]["port_connectivity"][f"port_{port}"] = {
+                "success": False, 
+                "error": str(e)
+            }
+    
+    # Check if any ports are open
+    open_ports = [port for port in ports_to_check 
+                  if debug_info["tests"]["port_connectivity"][f"port_{port}"]["success"]]
+    if not open_ports:
+        debug_info["recommendations"].append("No DepthAI ports are accessible - check PoE power and network configuration")
 
     # Test 3: DepthAI device discovery
     try:
@@ -528,6 +545,7 @@ async def debug_camera_connection(ip_address: str):
                 "found": False,
                 "available_devices": [d.name for d in devices],
             }
+            debug_info["recommendations"].append("Device not found by DepthAI discovery - may need to restart camera or check PoE power")
 
     except Exception as e:
         debug_info["tests"]["device_discovery"] = {"success": False, "error": str(e)}
@@ -547,5 +565,53 @@ async def debug_camera_connection(ip_address: str):
 
     except Exception as e:
         debug_info["tests"]["depthai_connection"] = {"success": False, "error": str(e)}
+        debug_info["recommendations"].append("DepthAI connection failed - check camera firmware and PoE power supply")
+
+    # Test 5: Network configuration check
+    try:
+        import netifaces
+        interfaces = netifaces.interfaces()
+        debug_info["tests"]["network_config"] = {
+            "interfaces": interfaces,
+            "local_ips": []
+        }
+        
+        for iface in interfaces:
+            addrs = netifaces.ifaddresses(iface)
+            if netifaces.AF_INET in addrs:
+                for addr in addrs[netifaces.AF_INET]:
+                    debug_info["tests"]["network_config"]["local_ips"].append(addr['addr'])
+                    
+        # Check if camera IP is in same subnet as any local interface
+        camera_ip_parts = ip_address.split('.')
+        same_subnet = False
+        for local_ip in debug_info["tests"]["network_config"]["local_ips"]:
+            if local_ip.startswith('127.'):  # Skip localhost
+                continue
+            local_ip_parts = local_ip.split('.')
+            if (camera_ip_parts[0] == local_ip_parts[0] and 
+                camera_ip_parts[1] == local_ip_parts[1] and
+                camera_ip_parts[2] == local_ip_parts[2]):
+                same_subnet = True
+                break
+                
+        debug_info["tests"]["network_config"]["same_subnet"] = same_subnet
+        if not same_subnet:
+            debug_info["recommendations"].append("Camera IP is not in the same subnet as host - check network configuration")
+            
+    except ImportError:
+        debug_info["tests"]["network_config"] = {"error": "netifaces module not available"}
+    except Exception as e:
+        debug_info["tests"]["network_config"] = {"error": str(e)}
+
+    # Add OAK Camera v3 specific recommendations
+    debug_info["recommendations"].extend([
+        "Ensure camera is powered via PoE+ (30W minimum power supply)",
+        "Check that PoE switch/injector supports 802.3at (PoE+) standard",
+        "Verify camera is properly connected to PoE port",
+        "Try power cycling the camera and PoE switch",
+        "Check for any firewall rules blocking ports 9876, 14495-14497",
+        "Ensure camera firmware is up to date"
+    ])
 
     return debug_info

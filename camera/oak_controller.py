@@ -75,21 +75,29 @@ class OakController:
                     devices = dai.Device.getAllAvailableDevices()
                     discovered = []
                     for device_info in devices:
+                        logger.info(f"Found device: {device_info.name}, Protocol: {device_info.protocol}, State: {device_info.state}")
                         if device_info.protocol == dai.XLinkProtocol.X_LINK_TCP_IP:
                             ip = device_info.name
                             state = device_info.state
-                            logger.info(f"Found camera: IP={ip}, State={state}")
+                            logger.info(f"Found PoE camera: IP={ip}, State={state}")
                             discovered.append(ip)
                     return discovered
                 except Exception as e:
                     logger.error(f"DepthAI discovery error: {e}")
                     return []
+                    
             discovered_cameras = await asyncio.get_event_loop().run_in_executor(
                 self._executor, _discover_devices
             )
+            
+            # Also try network discovery for cameras that might not be detected by DepthAI
             network_cameras = await self._discover_network_cameras()
             all_cameras = list(set(discovered_cameras + network_cameras))
+            
             logger.info(f"Discovered {len(all_cameras)} Oak cameras: {all_cameras}")
+            logger.info(f"DepthAI discovery: {discovered_cameras}")
+            logger.info(f"Network discovery: {network_cameras}")
+            
             return all_cameras
         except Exception as e:
             logger.error(f"Camera discovery failed: {e}")
@@ -97,26 +105,36 @@ class OakController:
 
     async def _discover_network_cameras(self, ip_range: str = "192.168.1") -> List[str]:
         discovered = []
-        ip_ranges = ["192.168.1", "192.168.0", "192.168.10", "10.0.0"]
+        # Common IP ranges for OAK cameras
+        ip_ranges = ["192.168.1", "192.168.0", "192.168.10", "10.0.0", "192.168.100"]
+        
         async def check_ip(ip: str):
             try:
-                future = asyncio.get_event_loop().run_in_executor(
-                    self._executor, self._is_port_open, ip, 9876, 1.0
-                )
-                is_open = await asyncio.wait_for(future, timeout=2.0)
-                if is_open:
-                    discovered.append(ip)
-                    logger.info(f"Network discovery found camera at: {ip}")
+                # Check multiple ports that OAK Camera v3 might use
+                ports_to_check = [9876, 14495, 14496, 14497]
+                for port in ports_to_check:
+                    future = asyncio.get_event_loop().run_in_executor(
+                        self._executor, self._is_port_open, ip, port, 1.0
+                    )
+                    is_open = await asyncio.wait_for(future, timeout=2.0)
+                    if is_open:
+                        discovered.append(ip)
+                        logger.info(f"Network discovery found camera at: {ip} (port {port})")
+                        return  # Found one port, no need to check others
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
                 logger.debug(f"Network check failed for {ip}: {e}")
+                
+        # Common IPs for OAK cameras
         common_ips = [
-            "192.168.1.100", "192.168.1.247",
-            "192.168.0.100", "192.168.0.247",
-            "192.168.10.100", "192.168.10.247",
-            "10.0.0.100", "10.0.0.247",
+            "192.168.1.100", "192.168.1.247", "192.168.1.200",
+            "192.168.0.100", "192.168.0.247", "192.168.0.200",
+            "192.168.10.100", "192.168.10.247", "192.168.10.200",
+            "10.0.0.100", "10.0.0.247", "10.0.0.200",
+            "192.168.100.100", "192.168.100.247", "192.168.100.200",
         ]
+        
         tasks = [check_ip(ip) for ip in common_ips]
         await asyncio.gather(*tasks, return_exceptions=True)
         return discovered
@@ -128,33 +146,79 @@ class OakController:
                 return False
             if self.is_connected:
                 await self.disconnect()
+            
             logger.info(f"Attempting to connect to Oak Camera at {ip_address}")
-            port_open = await asyncio.get_event_loop().run_in_executor(
-                self._executor, self._is_port_open, ip_address, 9876, 5.0
-            )
+            
+            # First, try to ping the device to ensure basic connectivity
+            ping_success = await self._ping_device(ip_address)
+            if not ping_success:
+                logger.warning(f"Device at {ip_address} is not responding to ping")
+                # Continue anyway as some devices might not respond to ping
+            
+            # Check multiple ports that OAK Camera v3 might use
+            ports_to_check = [9876, 14495, 14496, 14497]  # Common DepthAI ports
+            port_open = False
+            working_port = None
+            
+            for port in ports_to_check:
+                logger.info(f"Checking port {port} on {ip_address}")
+                port_open = await asyncio.get_event_loop().run_in_executor(
+                    self._executor, self._is_port_open, ip_address, port, 3.0
+                )
+                if port_open:
+                    working_port = port
+                    logger.info(f"Port {port} is open on {ip_address}")
+                    break
+                else:
+                    logger.debug(f"Port {port} is not accessible on {ip_address}")
+            
             if not port_open:
-                logger.error(f"Port 9876 not accessible on {ip_address}")
+                logger.error(f"No accessible ports found on {ip_address}. Checked ports: {ports_to_check}")
+                logger.error("Please ensure:")
+                logger.error("1. Camera is powered via PoE+ (30W minimum)")
+                logger.error("2. Camera and host are on the same network")
+                logger.error("3. No firewall is blocking the connection")
+                logger.error("4. Camera is properly connected to PoE switch/injector")
                 return False
-            logger.info(f"Port 9876 is open on {ip_address}")
+            
+            logger.info(f"Using port {working_port} for connection to {ip_address}")
+            
             def _connect_device():
                 try:
+                    # Try different connection methods for OAK Camera v3
                     device_info = dai.DeviceInfo(ip_address)
-                    logger.info(f"Creating device connection...")
-                    device = dai.Device(device_info)
+                    logger.info(f"Creating device connection with info: {device_info}")
+                    
+                    # Set connection timeout
+                    device = dai.Device(device_info, maxUsbSpeed=dai.UsbSpeed.SUPER)
+                    
                     if not device:
                         raise Exception("Failed to create device connection")
+                    
                     logger.info(f"Connected to device at {ip_address}")
                     return device
                 except Exception as e:
                     logger.error(f"DepthAI connection failed: {e}")
-                    raise
+                    # Try alternative connection method
+                    try:
+                        logger.info("Trying alternative connection method...")
+                        device = dai.Device(ip_address)
+                        if device:
+                            logger.info(f"Alternative connection successful to {ip_address}")
+                            return device
+                    except Exception as e2:
+                        logger.error(f"Alternative connection also failed: {e2}")
+                    raise e
+            
             self.device = await asyncio.get_event_loop().run_in_executor(
                 self._executor, _connect_device
             )
+            
             self.camera_ip = ip_address
             if not await self._setup_pipeline():
                 logger.error("Failed to setup camera pipeline")
                 return False
+                
             def _start_pipeline():
                 try:
                     self.device.start_pipeline(self.pipeline)
@@ -162,11 +226,13 @@ class OakController:
                 except Exception as e:
                     logger.error(f"Failed to start pipeline: {e}")
                     return False
+                    
             success = await asyncio.get_event_loop().run_in_executor(
                 self._executor, _start_pipeline
             )
             if not success:
                 return False
+                
             logger.info("Camera pipeline started")
             try:
                 self.control_queue = self.device.get_input_queue("control")
@@ -174,6 +240,7 @@ class OakController:
             except Exception as e:
                 logger.error(f"Failed to get queues: {e}")
                 return False
+                
             self.is_connected = True
             self.status.connected = True
             self.status.ip_address = ip_address
@@ -182,9 +249,30 @@ class OakController:
             logger.info(f"Successfully connected to Oak Camera at {ip_address}")
             await self.update_settings(self.current_settings)
             return True
+            
         except Exception as e:
             logger.error(f"Failed to connect to camera at {ip_address}: {e}")
             await self.disconnect()
+            return False
+
+    async def _ping_device(self, ip_address: str) -> bool:
+        """Ping device to check basic connectivity."""
+        try:
+            import subprocess
+            import platform
+            
+            if platform.system().lower() == "windows":
+                cmd = ["ping", "-n", "1", "-w", "3000", ip_address]
+            else:
+                cmd = ["ping", "-c", "1", "-W", "3", ip_address]
+                
+            result = await asyncio.get_event_loop().run_in_executor(
+                self._executor, 
+                lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            )
+            return result.returncode == 0
+        except Exception as e:
+            logger.debug(f"Ping failed for {ip_address}: {e}")
             return False
 
     async def disconnect(self):
