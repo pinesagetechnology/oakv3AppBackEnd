@@ -155,8 +155,16 @@ class OakController:
                 logger.warning(f"Device at {ip_address} is not responding to ping")
                 # Continue anyway as some devices might not respond to ping
             
-            # Check multiple ports that OAK Camera v3 might use
-            ports_to_check = [9876, 14495, 14496, 14497]  # Common DepthAI ports
+            # Check device state first before attempting connection
+            device_state = await self._check_device_state(ip_address)
+            if device_state:
+                logger.info(f"Device state: {device_state}")
+                if "X_LINK_GATE" in str(device_state):
+                    logger.warning("Device is in GATE state - may need power cycle or initialization")
+            
+            # For OAK4-D-PRO-W, try connection even if ports appear closed
+            # The device might be in a state where ports aren't immediately accessible
+            ports_to_check = [9876, 14495, 14496, 14497]
             port_open = False
             working_port = None
             
@@ -172,16 +180,11 @@ class OakController:
                 else:
                     logger.debug(f"Port {port} is not accessible on {ip_address}")
             
+            # For OAK4-D-PRO-W, try connection even if ports are closed
+            # The device might initialize ports during connection
             if not port_open:
-                logger.error(f"No accessible ports found on {ip_address}. Checked ports: {ports_to_check}")
-                logger.error("Please ensure:")
-                logger.error("1. Camera is powered via PoE+ (30W minimum)")
-                logger.error("2. Camera and host are on the same network")
-                logger.error("3. No firewall is blocking the connection")
-                logger.error("4. Camera is properly connected to PoE switch/injector")
-                return False
-            
-            logger.info(f"Using port {working_port} for connection to {ip_address}")
+                logger.warning(f"No accessible ports found on {ip_address}, but attempting connection anyway")
+                logger.info("This is normal for OAK4-D-PRO-W in certain states")
             
             def _connect_device():
                 try:
@@ -189,8 +192,11 @@ class OakController:
                     device_info = dai.DeviceInfo(ip_address)
                     logger.info(f"Creating device connection with info: {device_info}")
                     
-                    # Set connection timeout
-                    device = dai.Device(device_info, maxUsbSpeed=dai.UsbSpeed.SUPER)
+                    # For OAK4-D-PRO-W, try with longer timeout and specific config
+                    config = dai.Device.Config()
+                    config.setLogLevel(dai.LogLevel.DEBUG)
+                    
+                    device = dai.Device(device_info, config)
                     
                     if not device:
                         raise Exception("Failed to create device connection")
@@ -557,6 +563,27 @@ class OakController:
                     time.sleep(0.01)
         except Exception as e:
             logger.error(f"Recording loop error: {e}")
+
+    async def _check_device_state(self, ip_address: str) -> str:
+        """Check the current state of the device."""
+        try:
+            def _get_device_state():
+                try:
+                    devices = dai.Device.getAllAvailableDevices()
+                    for device_info in devices:
+                        if device_info.name == ip_address:
+                            return str(device_info.state)
+                    return None
+                except Exception as e:
+                    logger.debug(f"Could not get device state: {e}")
+                    return None
+            
+            return await asyncio.get_event_loop().run_in_executor(
+                self._executor, _get_device_state
+            )
+        except Exception as e:
+            logger.debug(f"Device state check failed: {e}")
+            return None
 
     def __del__(self):
         try:
